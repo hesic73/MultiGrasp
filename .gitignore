@@ -5,3 +5,6 @@ hands
 *pycache*
 .vscode
 thirdparty/pytorch3d/
+
+
+/synthesis

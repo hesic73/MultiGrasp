@@ -40,7 +40,7 @@ def parse_args():
     parser.add_argument('--max_refine', default=1500, type=int)
 
     # Task settings - Hand
-    parser.add_argument('--hand_model', default='shadowhand', type=str)
+    parser.add_argument('--hand_model', default='allegro', type=str)
     parser.add_argument('--n_contact', default=3, type=int)
 
     # Task settings - Object

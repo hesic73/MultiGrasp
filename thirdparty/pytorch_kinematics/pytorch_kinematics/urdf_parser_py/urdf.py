@@ -543,7 +543,7 @@ class Robot(xmlr.Object):
         Warning: this requires roscore to be running.
         """
         # Could move this into xml_reflection
-        import rospy
+        import rospy  # type: ignore
         return cls.from_xml_string(rospy.get_param(key))
 
 
