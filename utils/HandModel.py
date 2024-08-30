@@ -279,13 +279,23 @@ class RoboticHand:
         q.requires_grad_()
         return q
 
-    def update_kinematics(self, q):
+    def update_kinematics(self, q: torch.Tensor):
         self.batch_size = q.shape[0]
         self.global_translation = q[:, :3] / self.scale
         self.global_rotation = compute_rotation_matrix_from_ortho6d(q[:, 3:9])
         self.current_status = self.robot.forward_kinematics(q[:, 9:])
 
-    def get_contact_points(self, cpi, cpw, q=None):
+    def get_contact_points(self, cpi: torch.Tensor, cpw: torch.Tensor, q=None):
+        """_summary_
+
+        Args:
+            cpi (torch.Tensor): contact point index. Shape: (n_batch, n_contact)
+            cpw (torch.Tensor): contact point weight. Shape: (n_batch, n_contact, 4)
+            q (_type_, optional): _description_. Defaults to None.
+
+        Returns:
+            _type_: _description_
+        """
         cpw = self.softmax(cpw)
         B = cpi.shape[0]
         if q is not None:
@@ -313,84 +323,23 @@ class RoboticHand:
 
         return cpb_trans * self.scale
 
-    def solve_pR(self, target_kpts):
-        B, N, _ = target_kpts.shape
-        canon_palm_facing_dir = torch.tensor(
-            [0., -1., 0.], dtype=torch.float32, device=self.device).unsqueeze(0).repeat(B, 1)
-        canon_vec_1 = torch.tensor(
-            [1.00, 0., 0.], dtype=torch.float32, device=self.device).unsqueeze(0).repeat(B, 1)
-        canon_pos = torch.tensor(
-            [0.0200, 0.0000, 0.0400], dtype=torch.float32, device=self.device).unsqueeze(0).repeat(B, 1)
-
-        vec_1 = target_kpts[:, -4] - target_kpts[:, -2]
-        vec_2 = target_kpts[:, -1] - target_kpts[:, -2]
-        palm_facing_dir = cross_product(vec_1, vec_2)
-        palm_facing_dir = palm_facing_dir / \
-            (torch.norm(palm_facing_dir, dim=-1, keepdim=True) + 1e-12)
-
-        # 1-stage method requires SVD decomposition, which is slow
-        # We use a 2-stage method to separately align the palm-facing direction and the rotation about it.
-        rotmat = rotation_of_vectors(canon_palm_facing_dir, palm_facing_dir)
-
-        vec_1 = vec_1 / (torch.norm(vec_1, dim=-1, keepdim=True) + 1e-12)
-        palm_facing_vec_1 = torch.matmul(
-            rotmat, canon_vec_1.unsqueeze(-1)).squeeze(-1)
-        pf_rotmat = rotation_of_vectors(palm_facing_vec_1, vec_1)
-        rotmat = torch.matmul(pf_rotmat, rotmat)
-
-        rot6d = compute_ortho6d_from_rotation_matrix(rotmat)
-
-        pos = target_kpts[:, -4:].mean(dim=1)
-        pf_canon_pos = torch.matmul(
-            rotmat, canon_pos.unsqueeze(-1)).squeeze(-1)
-        pos = pos - pf_canon_pos
-
-        return torch.cat([pos, rot6d], dim=-1)
-
-    def fit(self, target_kpts, init=None, n_steps=200, solve_pR=True):
-        B = target_kpts.shape[0]
-        if init is None:
-            init = torch.zeros(
-                [B, self.q_len], dtype=torch.float32, device=target_kpts.device)
-            init[:, [3, 7]] = 1.0
-
-        if solve_pR:
-            init[:, :9] = self.solve_pR(target_kpts)
-
-        p = init[:, 0:3].detach().clone().requires_grad_(True)
-        r = init[:, 3:9].detach().clone().requires_grad_(True)
-        j = init[:, 9:].detach().clone().requires_grad_(True)
-        optimizer = torch.optim.Adam([
-            # { "params": p, "lr": 1e-5 },
-            # { "params": r, "lr": 1e-5 },
-            {"params": j, "lr": 0.1}
-        ])
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, n_steps, 0.01)
-
-        for step in trange(n_steps):
-            optimizer.zero_grad()
-            q = torch.cat([p, r, j], dim=-1)
-            cur_kpts = self.get_hand_keypoints(q)
-            err = (target_kpts - cur_kpts).norm(dim=-1).mean(dim=-1).sum()
-            err.backward()
-            optimizer.step()
-            scheduler.step()
-            if step % 25 == 24:
-                tqdm.write(f"Step {step} | Mean L1 (m): {err.item() / B}")
-        return q.detach()
-
-    def self_penetration(self, q=None):
-        points = self.get_penetration_keypoints(q)
+    def self_penetration(self):
+        points = self.get_penetration_keypoints()
         dis = (points.unsqueeze(1) - points.unsqueeze(2) + 1e-13).norm(dim=-1)
         dis = torch.where(dis < 1e-6, 1e6 * torch.ones_like(dis), dis)
         self_pntr_energy = torch.relu(0.015 - dis)
         return self_pntr_energy.sum(dim=[1, 2])
 
-    def get_contact_areas(self, cpi, q=None):
+    def get_contact_areas(self, cpi: torch.Tensor):
+        """_summary_
+
+        Args:
+            cpi (torch.Tensor): contact point index. Shape: (n_batch, n_contact)
+
+        Returns:
+            _type_: _description_
+        """
         B, N_c = cpi.shape
-        if q is not None:
-            self.update_kinematics(q)
 
         ones = torch.ones([B, N_c, 4]).to(cpi.device) * 1e-10
 
@@ -405,20 +354,17 @@ class RoboticHand:
 
         return torch.stack(contacts, dim=-2)
 
-    def get_contact_points_and_normal(self, cpi: torch.Tensor, cpw: torch.Tensor, q=None):
+    def get_contact_points_and_normal(self, cpi: torch.Tensor, cpw: torch.Tensor):
         """_summary_
 
         Args:
             cpi (torch.Tensor): contact point index. Shape: (n_batch, n_contact)
             cpw (torch.Tensor): contact point weight. Shape: (n_batch, n_contact, 4)
-            q (_type_, optional): ???. Defaults to None.
 
         Returns:
             _type_: contact point basic, contact point normal. Shape: (n_batch, n_contact, 3), (n_batch, n_contact, 3)
         """
         cpw = self.softmax(cpw)
-        if q is not None:
-            self.update_kinematics(q)
         B, *_ = cpi.shape
         cpb_trans, cpn_trans = [], []
         for link_name in self.contact_point_basis:
@@ -457,7 +403,15 @@ class RoboticHand:
         # (n_batch, n_contact, 3), (n_batch, n_contact, 3)
         return cpb_trans * self.scale, cpn_trans
 
-    def prior(self, q):
+    def prior(self, q: torch.Tensor):
+        """_summary_
+
+        Args:
+            q (torch.Tensor): (n_batch, q_len)
+
+        Returns:
+            _type_: _description_
+        """
         range_energy = torch.relu(q[:, 9:] - self.revolute_joints_q_upper) + \
             torch.relu(self.revolute_joints_q_lower - q[:, 9:])
         return range_energy.sum(-1)
@@ -479,9 +433,7 @@ class RoboticHand:
             1, 2)).transpose(1, 2) + self.global_translation.unsqueeze(1)
         return surface_points * self.scale
 
-    def get_penetration_keypoints(self, q=None):
-        if q is not None:
-            self.update_kinematics(q)
+    def get_penetration_keypoints(self):
         kpts = []
 
         for link_name, canon_kpts in self.penetration_keypoints_dict.items():
@@ -494,9 +446,7 @@ class RoboticHand:
             1, 2) + self.global_translation.unsqueeze(1)
         return kpts * self.scale
 
-    def get_hand_keypoints(self, q=None):
-        if q is not None:
-            self.update_kinematics(q)
+    def get_hand_keypoints(self):
         kpts = []
 
         for link_name, canon_kpts in self.hand_keypoints_dict.items():
