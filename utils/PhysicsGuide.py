@@ -210,13 +210,13 @@ class PhysicsGuide:
             return force_closure, distance, penetration, hand_prior, normal_alignment
 
     # def get_stepsize(self, energy):
-    def get_stepsize(self, t):
+    def get_stepsize(self, t: int) -> torch.Tensor:
         # (t // stepsize_period)
         return self.args.noise_size * self.args.temperature_decay ** torch.div(t, self.args.stepsize_period, rounding_mode='floor')
         # return 0.02600707 + energy.unsqueeze(1) * 0.03950357 * 1e-3
 
     # def get_temperature(self, energy):
-    def get_temperature(self, t):
+    def get_temperature(self, t: int) -> torch.Tensor:
         # (t // annealing_period)
         return self.args.starting_temperature * self.args.temperature_decay ** torch.div(t, self.args.annealing_period, rounding_mode='floor')
         # return 0.02600707 + energy * 0.03950357
