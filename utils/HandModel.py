@@ -64,9 +64,6 @@ class RoboticHand:
         self.hand_keypoints_dict = {k: F.pad(
             v, (0, 1), mode='constant', value=1.0) for k, v in self.hand_keypoints_dict.items()}
 
-        self.n_keypoints: int = sum([v.shape[0]
-                                    for v in self.hand_keypoints_dict.values()])
-
         visual: Robot = URDF.from_xml_string(open(urdf_filename).read())
 
         self.mesh_verts = {}
@@ -281,8 +278,9 @@ class RoboticHand:
 
     def update_kinematics(self, q: torch.Tensor):
         self.batch_size = q.shape[0]
-        self.global_translation = q[:, :3] / self.scale
-        self.global_rotation = compute_rotation_matrix_from_ortho6d(q[:, 3:9])
+        self.global_translation = q[:, :3] / self.scale  # (batch_size, 3)
+        self.global_rotation = compute_rotation_matrix_from_ortho6d(
+            q[:, 3:9])  # (batch_size, 3, 3)
         self.current_status = self.robot.forward_kinematics(q[:, 9:])
 
     def get_contact_points(self, cpi: torch.Tensor, cpw: torch.Tensor, q=None):
