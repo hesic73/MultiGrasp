@@ -130,7 +130,7 @@ def synthesis(args, export_configs):
 
     contact_group: List[List[int]] = contact_groups[args.contact_group]
     contact_pools: List[torch.Tensor] = [torch.tensor(get_contact_pool(
-        g), dtype=torch.long, device=args.device) for g in contact_group][:n_objects]
+        g), dtype=torch.long, device=args.device) for g in contact_group[:n_objects]]
 
     logger.info("> Loading models...")
     hand_model = get_hand_model(
@@ -148,22 +148,20 @@ def synthesis(args, export_configs):
     logger.info(f"  + Objects: ({ ', '.join(args.object_models) })")
     logger.info(f"  + Export directory: { export_dir }")
 
-    def sum_energy(new_fc_error, new_sf_dist, new_pntr, new_hprior, low_fc_w=False):
+    def sum_energy(new_fc_error: torch.Tensor, new_sf_dist: torch.Tensor, new_pntr: torch.Tensor, new_hprior: torch.Tensor, low_fc_w=False) -> torch.Tensor:
         new_energy = 0
         new_energy = new_energy + new_fc_error * args.fc_error_weight
         new_energy = new_energy + new_sf_dist * args.sf_dist_weight
         new_energy = new_energy + new_pntr * args.pen_weight
         new_energy = new_energy + new_hprior * args.hprior_weight
-
-        return new_energy
+        return new_energy  # (batch_size,)
 
     logger.info("> Initializing hand...")
-    q = hand_model.random_handcode(args.batch_size, table_top=True)
+    q = hand_model.random_handcode(
+        args.batch_size, table_top=True)  # (batch_size, q_len)
 
-    cpi = torch.randint(0, len(hand_model.contact_point_dict), [
-                        args.batch_size, n_objects, args.n_contact], device=args.device, dtype=torch.long)
     cpw = torch.normal(0, 1, [args.batch_size, n_objects, args.n_contact,
-                       4], requires_grad=True, device=args.device).float()
+                       4], requires_grad=True, device=args.device).float()  # (batch_size, n_objects, n_contact, 4)
 
     cpi = []
     for i_contact_set, contact_pool in enumerate(contact_pools):
@@ -172,7 +170,7 @@ def synthesis(args, export_configs):
                               args.batch_size, args.n_contact], device=args.device, dtype=torch.long)
         contacts = torch.gather(_contact_pool, 1, cpi_i)
         cpi.append(contacts)
-    cpi = torch.stack(cpi, dim=1)
+    cpi = torch.stack(cpi, dim=1)  # (batch_size, n_objects, n_contact)
 
     logger.info("> Initializing objects...")
     object_ps = []
@@ -189,23 +187,18 @@ def synthesis(args, export_configs):
                 [args.batch_size, n_objects, 3], device=args.device) * 0.075 - 0.0375
 
         for i_object, object_model in enumerate(physics_guide.object_models):
-            if object_model.object_model == "sphere":
-                proposals_xyz[:, i_object, 2] = object_model.radius
-                proposals_rot = torch.eye(3, device=args.device).unsqueeze(
-                    0).repeat([args.batch_size, 1, 1])
-            else:
-                proposals_rot_i = torch.randint(0, len(object_model.stable_rotations), [
-                                                args.batch_size], device=args.device, dtype=torch.long)
-                proposals_rot = object_model.stable_rotations[proposals_rot_i]
-                random_z_rot = torch.rand(
-                    [args.batch_size], dtype=torch.float32, device=args.device) * 2 * torch.pi
-                random_z_rot_axis = F.pad(
-                    random_z_rot.unsqueeze(-1), (2, 0), 'constant', 0)
-                random_z_rot_mat = transforms.axis_angle_to_matrix(
-                    random_z_rot_axis)
-                proposals_rot = torch.matmul(random_z_rot_mat, proposals_rot)
-                proposals_xyz[:, i_object,
-                              2] = object_model.stable_zs[proposals_rot_i]
+            proposals_rot_i = torch.randint(0, len(object_model.stable_rotations), [
+                                            args.batch_size], device=args.device, dtype=torch.long)
+            proposals_rot = object_model.stable_rotations[proposals_rot_i]
+            random_z_rot = torch.rand(
+                [args.batch_size], dtype=torch.float32, device=args.device) * 2 * torch.pi
+            random_z_rot_axis = F.pad(
+                random_z_rot.unsqueeze(-1), (2, 0), 'constant', 0)
+            random_z_rot_mat = transforms.axis_angle_to_matrix(
+                random_z_rot_axis)
+            proposals_rot = torch.matmul(random_z_rot_mat, proposals_rot)
+            proposals_xyz[:, i_object,
+                          2] = object_model.stable_zs[proposals_rot_i]
             object_model.update_pose(proposals_xyz[:, i_object], proposals_rot)
 
         oo_pen = physics_guide.oo_penetration()

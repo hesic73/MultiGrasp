@@ -19,9 +19,14 @@ from utils.utils_3d import do_rotation, do_translation
 
 from .EMA import EMA
 
+from .HandModel import RoboticHand
+from .ObjectModels import ODFieldModel
+
+from typing import List, Tuple
+
 
 class PhysicsGuide:
-    def __init__(self, hand_model, args):
+    def __init__(self, hand_model: RoboticHand, args):
         self.epsilon = 1e-4
         self.hand_model = hand_model
         self.n_contact_total = self.hand_model.n_pts
@@ -35,7 +40,7 @@ class PhysicsGuide:
         # self.object_no = 0
         self.joint_mask = torch.ones(
             [self.args.batch_size, self.hand_model.q_len], device='cuda', dtype=torch.int32)
-        self.object_models = []
+        self.object_models: List[ODFieldModel] = []
 
         self.optimizer = None
 
@@ -44,22 +49,16 @@ class PhysicsGuide:
         else:
             self.ho_penetration = self.ho_pen_oc
 
-        self.is_sphere = []
-        self.table_height = 0
+        self.table_height: float = 0.0
 
     def append_object(self, new_object_model):
-        if self.object_models is not None and len(self.object_models) > 0:
-            # if self.args.object_contact:
-            #     self.n_contact_total += self.object_models[-1].num_pts
-            self.object_models.append(new_object_model)
-        else:
-            self.object_models = [new_object_model]
+        self.object_models = [new_object_model]
 
-    def get_vertices(self, q=None, with_objects=False):
+    def get_vertices(self, q=None):
         vertices = self.hand_model.get_vertices(q)
         return vertices
 
-    def get_contacts(self, contact_idx, qs, q=None, downsample=True, no_base=False, with_objects=False):
+    def get_contacts(self, contact_idx, qs, q=None, downsample: bool = True, no_base: bool = False, with_objects: bool = False):
         # vertices = self.hand_model.get_vertices(qs[:, -1])
         # self.hand_model.get_contact_points(contact_idx, contact_point_weight, qs[:, -1])
         # if handcodes is None:
@@ -94,11 +93,11 @@ class PhysicsGuide:
 
         return vertices, normals
 
-    def ho_pen_oc(self, obj, hand_verts=None):
+    def ho_pen_oc(self, obj: ODFieldModel, hand_verts=None):
         # return obj.po_penetration(hand_verts).max(-1)[0]
         return obj.po_penetration(hand_verts).sum(dim=-1)
 
-    def ho_pen_hc(self, obj, hand_verts=None):
+    def ho_pen_hc(self, obj: ODFieldModel, hand_verts=None):
         return self.hand_model.penetration(obj.get_surface_points()).sum(dim=-1) * 1000
 
     def oo_penetration(self):
@@ -140,7 +139,18 @@ class PhysicsGuide:
 
         return penetration
 
-    def compute_energy(self, cpi, cpw, q, reduce=True):
+    def compute_energy(self, cpi: torch.Tensor, cpw: torch.Tensor, q: torch.Tensor, reduce: bool = True):
+        """_summary_
+
+        Args:
+            cpi (torch.Tensor): contact point index. Shape: (n_batch, n_obj, n_contact)
+            cpw (torch.Tensor): contact point weight. Shape: (n_batch, n_obj, n_contact, 4)
+            q (torch.Tensor): ???. Shape: (n_batch, ?)
+            reduce (bool, optional): _description_. Defaults to True.
+
+        Returns:
+            _type_: _description_
+        """
         B, N_o, N_c = cpi.shape
 
         # Compute hand

@@ -27,59 +27,6 @@ from kaolin.metrics.trianglemesh import point_to_mesh_distance
 from kaolin.ops.mesh import check_sign, index_vertices_by_faces, face_normals
 
 
-class ObjectModel(metaclass=ABCMeta):
-    def __init__(self):
-        pass
-
-    @abstractmethod
-    def _sample_pts(self, num_pts=512):
-        """
-        Sample points on the object.
-
-        Used for penetration detection, distance calculation.
-        Used as contact points.
-        """
-        pass
-
-    @abstractmethod
-    def po_penetration(self, points, self_center=None, self_rotation=None):
-        """
-        Penetration from a point cloud to the objects.
-        """
-        pass
-
-    @abstractmethod
-    def mo_penetration(self, points, self_center=None, self_rotation=None):
-        """
-        Penetration from a mesh to the objects.
-        """
-        pass
-
-    @abstractmethod
-    def distance(self, points):
-        """
-        Calculate distances from query points x to the object
-        """
-        pass
-
-    @abstractmethod
-    def distance_gradient(self, points):
-        """
-        Calculate the gradient of distance, indicating the best direction of approching the object.
-        """
-        pass
-
-    @abstractmethod
-    def get_plot(self, idx, color='lightblue', opacity=0.9):
-        """
-        Get mesh of the object.
-        """
-        pass
-
-    def update_pose(self, transl, orient):
-        pass
-
-
 class ODFieldModel():
     def __init__(self, object_model: str, batch_size: int, num_pts: int = 256, scale: float = 1.0, device='cuda', signed: bool = True):
         self.device = device

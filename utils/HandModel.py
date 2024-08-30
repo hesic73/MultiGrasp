@@ -224,7 +224,16 @@ class RoboticHand:
             [1, self.num_contacts, 4], dtype=torch.float32, device=device)
         # print(f"[{hand_model}] {self.num_contacts} contact points, {self.n_pts} surface points")
 
-    def random_handcode(self, batch_size, table_top=True):
+    def random_handcode(self, batch_size: int, table_top: bool = True) -> torch.Tensor:
+        """_summary_
+
+        Args:
+            batch_size (int): _description_
+            table_top (bool, optional): _description_. Defaults to True.
+
+        Returns:
+            torch.Tensor: (batch_size, q_len)
+        """
         transf = torch.normal(
             0, 1, [batch_size, 9], device=self.device, dtype=torch.float32)
         # joints = torch.rand([batch_size, self.q_len - 9], device=self.device, dtype=torch.float32)
@@ -396,7 +405,17 @@ class RoboticHand:
 
         return torch.stack(contacts, dim=-2)
 
-    def get_contact_points_and_normal(self, cpi, cpw, q=None):
+    def get_contact_points_and_normal(self, cpi: torch.Tensor, cpw: torch.Tensor, q=None):
+        """_summary_
+
+        Args:
+            cpi (torch.Tensor): contact point index. Shape: (n_batch, n_contact)
+            cpw (torch.Tensor): contact point weight. Shape: (n_batch, n_contact, 4)
+            q (_type_, optional): ???. Defaults to None.
+
+        Returns:
+            _type_: contact point basic, contact point normal. Shape: (n_batch, n_contact, 3), (n_batch, n_contact, 3)
+        """
         cpw = self.softmax(cpw)
         if q is not None:
             self.update_kinematics(q)
@@ -435,6 +454,7 @@ class RoboticHand:
         cpn_trans = torch.matmul(self.global_rotation,
                                  cpn_trans.transpose(1, 2)).transpose(1, 2)
 
+        # (n_batch, n_contact, 3), (n_batch, n_contact, 3)
         return cpb_trans * self.scale, cpn_trans
 
     def prior(self, q):
