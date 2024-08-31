@@ -6,7 +6,7 @@ LastEditors: Aiden Li (i@aidenli.net)
 LastEditTime: 2022-07-15 01:11:09
 Description: Grasp Synthesis with MCMC with contact point weights
 '''
-import argparse
+
 import json
 import os
 from pytorch3d import transforms
@@ -33,99 +33,73 @@ from loguru import logger
 from torch.optim.adam import Adam
 
 
-from typing import List
+from typing import List, Tuple
+
+import typer
+from argparse import Namespace
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    # Computation
-    parser.add_argument('--batch_size', default=1024, type=int)
-    parser.add_argument('--max_physics', default=6500, type=int)
-    parser.add_argument('--max_refine', default=1500, type=int)
-
-    # Task settings - Hand
-    parser.add_argument('--hand_model', default='allegro', type=str)
-    parser.add_argument('--n_contact', default=3, type=int)
-
-    # Task settings - Object
-    parser.add_argument('--object_models', nargs='+',
-                        default=['knob', 'cylinder'], type=str)
-    parser.add_argument('--num_obj_pts', default=256, type=int)
-
-    # MCMC params
-    parser.add_argument('--starting_temperature', default=8., type=float)
-    parser.add_argument('--contact_switch', default=0.25, type=float)
-    parser.add_argument('--temperature_decay', default=0.95, type=float)
-    parser.add_argument('--stepsize_period', default=100, type=int)
-    parser.add_argument('--annealing_period', default=50, type=int)
-    parser.add_argument('--contact_group', type=int, default=0)
-    parser.add_argument('--langevin_probability', default=0.85, type=float)
-    parser.add_argument('--noise_size', default=0.01, type=float)
-
-    # Metric Weights
-    parser.add_argument('--fc_error_weight', default=1.0,
-                        type=float, help="Weight for force-closure error energy")
-    parser.add_argument('--hprior_weight', default=10.0,
-                        type=float, help="Weight for hand prior energy")
-    parser.add_argument('--pen_weight', default=10.0, type=float,
-                        help="Weight for hand-object penetraiton energy")
-    parser.add_argument('--sf_dist_weight', default=10.0, type=float,
-                        help="Weight for hand-object surface distance energy")
-    parser.add_argument('--hc_pen', action='store_true',
-                        help="Enable hand self-penetration energy")
-    parser.add_argument('--viz', action='store_true',
-                        help="Visualize periodically")
-    parser.add_argument('--log', action='store_true',
-                        help="Log information periodically")
-
-    parser.add_argument('--levitate', action='store_true',
-                        help="Grasping levitate objects, rather than on the tabletop")
-
-    # Debugging
-    parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--output_dir', default='synthesis', type=str)
-    parser.add_argument('--tag', default='debug', type=str)
-
-    return parser.parse_args()
+def get_cpi(contact_pools: List[torch.Tensor], batch_size: int, n_contact: int, device) -> torch.Tensor:
+    cpi = []
+    for i_contact_set, contact_pool in enumerate(contact_pools):
+        _contact_pool = contact_pool.unsqueeze(0).tile([batch_size, 1])
+        cpi_i = torch.randint(0, len(contact_pool), [
+                              batch_size, n_contact], device=device, dtype=torch.long)
+        contacts = torch.gather(_contact_pool, 1, cpi_i)
+        cpi.append(contacts)
+    cpi = torch.stack(cpi, dim=1)  # (batch_size, n_objects, n_contact)
+    return cpi
 
 
-def initialize(args):
-    # Computation device
-    args.device = torch.device(
-        'cuda') if torch.cuda.is_available() else torch.device('cpu')
+def sample_object_positions_and_rotations(physics_guide: PhysicsGuide, n_objects: int, batch_size: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
+    object_ps = []
+    object_rs = []
+    n_object_poses = 0
 
-    # Time tag and export directories
-    time_tag = datetime.now().strftime('%Y-%m/%d/%H-%M-%S')
-    base_dir = f"{ str(args.output_dir) }/{ str(args.hand_model) }/{ time_tag }_{ '+'.join(args.object_models) }-seed_{args.seed}-{args.tag}"
+    # Sample table-top object placement until the batch_size is fulfilled
+    while n_object_poses < batch_size:
+        if n_objects > 3:
+            proposals_xyz = torch.rand(
+                [batch_size, n_objects, 3], device=device) * 0.15 - 0.075
+        else:
+            proposals_xyz = torch.rand(
+                [batch_size, n_objects, 3], device=device) * 0.075 - 0.0375
 
-    logger.add(os.path.join(base_dir, "log.txt"),
-               rotation="10 MB", format="{time} {level} {message}")
-    logger.info(f"Logging to { os.path.join(base_dir, 'log.txt') }")
+        for i_object, object_model in enumerate(physics_guide.object_models):
+            proposals_rot_i = torch.randint(0, len(object_model.stable_rotations), [
+                                            batch_size], device=device, dtype=torch.long)
+            proposals_rot = object_model.stable_rotations[proposals_rot_i]
+            random_z_rot = torch.rand(
+                [batch_size], dtype=torch.float32, device=device) * 2 * torch.pi
+            random_z_rot_axis = F.pad(
+                random_z_rot.unsqueeze(-1), (2, 0), 'constant', 0)
+            random_z_rot_mat = transforms.axis_angle_to_matrix(
+                random_z_rot_axis)
+            proposals_rot = torch.matmul(random_z_rot_mat, proposals_rot)
+            proposals_xyz[:, i_object,
+                          2] = object_model.stable_zs[proposals_rot_i]
+            object_model.update_pose(proposals_xyz[:, i_object], proposals_rot)
 
-    os.makedirs(base_dir, exist_ok=True)
+        oo_pen = physics_guide.oo_penetration()
+        selected = torch.where(oo_pen < 0.0001)[0]
+        n_append = min(len(selected), batch_size - n_object_poses)
+        n_object_poses += n_append
+        selected = selected[:n_append]
+        object_ps.append(proposals_xyz[selected].clone())
+        object_rs.append(torch.stack(
+            [o.orient for o in physics_guide.object_models], dim=1)[selected].clone())
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    object_ps = torch.cat(object_ps, dim=0).contiguous()
+    object_rs = torch.cat(object_rs, dim=0).contiguous()
 
-    writer = SummaryWriter(logdir=base_dir)
-
-    json.dump(vars(args), open(os.path.join(
-        base_dir, "args.json"), 'w'), default=lambda o: str(o))
-
-    return {
-        "writer": writer,
-        "base_dir": base_dir,
-        "time_tag": time_tag,
-    }
+    return object_ps, object_rs
 
 
-def synthesis(args, export_configs):
-    writer = export_configs['writer']
+def synthesis(args, writer: SummaryWriter, export_dir: str):
     n_objects = len(args.object_models)
 
     transl_decay = 1.0
-    export_dir = export_configs['base_dir']
+
     uuids = [str(uuid4()) for _ in range(args.batch_size)]
 
     contact_group: List[List[int]] = contact_groups[args.contact_group]
@@ -163,59 +137,16 @@ def synthesis(args, export_configs):
     cpw = torch.normal(0, 1, [args.batch_size, n_objects, args.n_contact,
                        4], requires_grad=True, device=args.device).float()  # (batch_size, n_objects, n_contact, 4)
 
-    cpi = []
-    for i_contact_set, contact_pool in enumerate(contact_pools):
-        _contact_pool = contact_pool.unsqueeze(0).tile([args.batch_size, 1])
-        cpi_i = torch.randint(0, len(contact_pool), [
-                              args.batch_size, args.n_contact], device=args.device, dtype=torch.long)
-        contacts = torch.gather(_contact_pool, 1, cpi_i)
-        cpi.append(contacts)
-    cpi = torch.stack(cpi, dim=1)  # (batch_size, n_objects, n_contact)
+    cpi = get_cpi(contact_pools, args.batch_size, args.n_contact,
+                  args.device)  # (batch_size, n_objects, n_contact)
 
     logger.info("> Initializing objects...")
-    object_ps = []
-    object_rs = []
-    n_object_poses = 0
 
-    # Sample table-top object placement until the batch_size is fulfilled
-    while True:
-        if len(args.object_models) > 3:
-            proposals_xyz = torch.rand(
-                [args.batch_size, n_objects, 3], device=args.device) * 0.15 - 0.075
-        else:
-            proposals_xyz = torch.rand(
-                [args.batch_size, n_objects, 3], device=args.device) * 0.075 - 0.0375
-
-        for i_object, object_model in enumerate(physics_guide.object_models):
-            proposals_rot_i = torch.randint(0, len(object_model.stable_rotations), [
-                                            args.batch_size], device=args.device, dtype=torch.long)
-            proposals_rot = object_model.stable_rotations[proposals_rot_i]
-            random_z_rot = torch.rand(
-                [args.batch_size], dtype=torch.float32, device=args.device) * 2 * torch.pi
-            random_z_rot_axis = F.pad(
-                random_z_rot.unsqueeze(-1), (2, 0), 'constant', 0)
-            random_z_rot_mat = transforms.axis_angle_to_matrix(
-                random_z_rot_axis)
-            proposals_rot = torch.matmul(random_z_rot_mat, proposals_rot)
-            proposals_xyz[:, i_object,
-                          2] = object_model.stable_zs[proposals_rot_i]
-            object_model.update_pose(proposals_xyz[:, i_object], proposals_rot)
-
-        oo_pen = physics_guide.oo_penetration()
-        selected = torch.where(oo_pen < 0.0001)[0]
-        n_append = min(len(selected), args.batch_size - n_object_poses)
-        n_object_poses += n_append
-        selected = selected[:n_append]
-        object_ps.append(proposals_xyz[selected].clone())
-        object_rs.append(torch.stack(
-            [o.orient for o in physics_guide.object_models], dim=1)[selected].clone())
-        if n_object_poses == args.batch_size:
-            object_ps = torch.cat(object_ps, dim=0).contiguous()
-            object_rs = torch.cat(object_rs, dim=0).contiguous()
-            for i_object, object_model in enumerate(physics_guide.object_models):
-                object_model.update_pose(
-                    object_ps[:, i_object], object_rs[:, i_object])
-            break
+    object_ps, object_rs = sample_object_positions_and_rotations(
+        physics_guide, n_objects, args.batch_size, args.device)  # (batch_size, n_objects, 3), (batch_size, n_objects, 3, 3)
+    for i_object, object_model in enumerate(physics_guide.object_models):
+        object_model.update_pose(
+            object_ps[:, i_object], object_rs[:, i_object])
 
     torch.cuda.empty_cache()
 
@@ -230,16 +161,18 @@ def synthesis(args, export_configs):
         energy_grad.sum(), [q, cpw], allow_unused=True)
     grad_q[:, :9] = grad_q[:, :9] * transl_decay
 
+    ones = torch.arange(0, args.batch_size, device=args.device).long()
+
     # Steps with contact adjustment
     for step in tqdm(range(args.max_physics)):
-        step_size = physics_guide.get_stepsize(step)
-        temperature = physics_guide.get_temperature(step)
+        step_size = physics_guide.get_stepsize(step)  # (,)
+        temperature = physics_guide.get_temperature(step)  # (,)
         new_q = q.clone()
         new_cpi = cpi.clone()
 
         q_grad_weight = max(args.max_physics * 0.8 - step,
                             0) / args.max_physics * 75 + 25
-        ones = torch.arange(0, args.batch_size, device=args.device).long()
+
         # Updating handcode
         grad_q[:, 9:] = grad_q[:, 9:] / \
             (physics_guide.grad_ema_q.average.unsqueeze(0) + 1e-12)
@@ -413,9 +346,91 @@ def save(args, export_dir, uuids, physics_guide, q, cpi, cpw, fc_error, sf_dist,
             torch.save(save_dict, os.path.join(export_dir, f"ckpt-{step}.pt"))
 
 
+def main(
+    batch_size: int = 1024,
+    max_physics: int = 6500,
+    max_refine: int = 1500,
+    hand_model: str = "allegro",
+    n_contact: int = 3,
+    object_models: list[str] = typer.Option(
+        ["cube", "cube"], help="List of object models"),
+    num_obj_pts: int = 256,
+    starting_temperature: float = 8.0,
+    contact_switch: float = 0.25,
+    temperature_decay: float = 0.95,
+    stepsize_period: int = 100,
+    annealing_period: int = 50,
+    contact_group: int = 0,
+    langevin_probability: float = 0.85,
+    noise_size: float = 0.01,
+    fc_error_weight: float = 1.0,
+    hprior_weight: float = 10.0,
+    pen_weight: float = 10.0,
+    sf_dist_weight: float = 10.0,
+    hc_pen: bool = False,
+    viz: bool = False,
+    log: bool = False,
+    levitate: bool = False,
+    seed: int = 42,
+    output_dir: str = "synthesis",
+    tag: str = "debug"
+):
+
+    # Computation device
+    device = torch.device(
+        'cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+    args = Namespace(
+        batch_size=batch_size,
+        max_physics=max_physics,
+        max_refine=max_refine,
+        hand_model=hand_model,
+        n_contact=n_contact,
+        object_models=object_models,
+        num_obj_pts=num_obj_pts,
+        starting_temperature=starting_temperature,
+        contact_switch=contact_switch,
+        temperature_decay=temperature_decay,
+        stepsize_period=stepsize_period,
+        annealing_period=annealing_period,
+        contact_group=contact_group,
+        langevin_probability=langevin_probability,
+        noise_size=noise_size,
+        fc_error_weight=fc_error_weight,
+        hprior_weight=hprior_weight,
+        pen_weight=pen_weight,
+        sf_dist_weight=sf_dist_weight,
+        hc_pen=hc_pen,
+        viz=viz,
+        log=log,
+        levitate=levitate,
+        seed=seed,
+        output_dir=output_dir,
+        tag=tag,
+        device=device
+    )
+
+    # Time tag and export directories
+    time_tag = datetime.now().strftime('%Y-%m/%d/%H-%M-%S')
+    base_dir = f"{ str(output_dir) }/{ hand_model }/{ time_tag }_{ '+'.join(object_models) }-seed_{seed}-{tag}"
+
+    logger.add(os.path.join(base_dir, "log.txt"),
+               rotation="10 MB", format="{time} {level} {message}")
+    logger.info(f"Logging to { os.path.join(base_dir, 'log.txt') }")
+
+    os.makedirs(base_dir, exist_ok=True)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    writer = SummaryWriter(logdir=base_dir)
+
+    json.dump(vars(args), open(os.path.join(
+        base_dir, "args.json"), 'w'), default=lambda o: str(o))
+
+    synthesis(args, writer, base_dir)
+
+
 if __name__ == '__main__':
-    args = parse_args()
-
-    export_configs = initialize(args)
-
-    synthesis(args, export_configs)
+    typer.run(main)
