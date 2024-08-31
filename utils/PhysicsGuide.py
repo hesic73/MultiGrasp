@@ -52,7 +52,7 @@ class PhysicsGuide:
         self.table_height: float = 0.0
 
     def append_object(self, new_object_model):
-        self.object_models = [new_object_model]
+        self.object_models.append(new_object_model)
 
     def get_vertices(self, q=None):
         vertices = self.hand_model.get_vertices(q)

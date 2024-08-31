@@ -329,8 +329,8 @@ def synthesis(args, export_configs):
 
     logger.info("> Refining grasps...")
     args.sf_dist_weight = 20.0
-    q = torch.tensor(q.detach().clone(), requires_grad=True)
-    cpw = torch.tensor(cpw.detach().clone(), requires_grad=True)
+    q = q.detach().clone().requires_grad_(True)
+    cpw = cpw.detach().clone().requires_grad_(True)
     optimizer = torch.optim.Adam(
         [{"params": q, "lr": 1e-2}, {"params": cpw, "lr": 1e-1}])
 
@@ -373,7 +373,7 @@ def synthesis(args, export_configs):
             for i in range(8):
                 go.Figure([plot_mesh(o.get_obj_mesh(i), name=f"object-{j}") for j, o in enumerate(physics_guide.object_models)]
                           + [plot_point_cloud(pntr_kpts[i],
-                                              name=f"pntr-kpts", color='blue')]
+                                              name=f"pntr-kpts", surfacecolor='blue')]
                           + [plot_point_cloud(contact_pts[j][i], name=f"contact-{j}") for j in range(n_objects)]
                           + [plot_rect(contacts[j][i, k], name=f"contact-{j}_{k}", color='red') for j in range(
                               n_objects) for k in range(args.n_contact)]
