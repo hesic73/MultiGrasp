@@ -19,7 +19,7 @@ import torch
 import trimesh as tm
 from plotly import graph_objects as go
 from tqdm import tqdm, trange
-from hand_consts import get_contact_pool, contact_groups
+from hand_consts_allegro import get_contact_pool, contact_groups
 
 from utils.HandModel import get_hand_model
 from utils.ObjectModels import get_object_model

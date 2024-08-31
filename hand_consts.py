@@ -53,13 +53,13 @@ from typing import List
 
 
 def get_contact_pool(contact: List[int]) -> List[int]:
-    """get indices of contact links (I'm not sure)
+    """get indices of contact areas
 
     Args:
         contact (List[int]): contact hand parts (0: palm, 1: thumb, 2: index, 3: middle, 4: ring, 5: pinky)
 
     Returns:
-        List[int]: indices of contact links
+        List[int]: indices of contact areas
     """
     idxs_pool = []
 
