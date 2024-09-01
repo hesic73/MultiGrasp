@@ -17,7 +17,6 @@ from utils.Losses import FCLoss
 from utils.utils import *
 from utils.utils_3d import do_rotation, do_translation
 
-from .EMA import EMA
 
 from .HandModel import RoboticHand
 from .ObjectModels import ODFieldModel
@@ -32,33 +31,26 @@ class PhysicsGuide:
         self.n_contact_total = self.hand_model.n_pts
 
         self.fc_loss_model = FCLoss()
-        self.args = args
-        self.grad_ema_q = EMA(0.98)
-        self.grad_ema_w = EMA(0.98)
 
-        self.arange = torch.arange(self.args.batch_size).cuda()
+        self.batch_size: int = args.batch_size
+        self.levitate: bool = args.levitate
+
+        self.arange = torch.arange(self.batch_size).cuda()
         # self.object_no = 0
         self.joint_mask = torch.ones(
-            [self.args.batch_size, self.hand_model.q_len], device='cuda', dtype=torch.int32)
+            [self.batch_size, self.hand_model.q_len], device='cuda', dtype=torch.int32)
         self.object_models: List[ODFieldModel] = []
-
-        self.optimizer = None
-
-        if 'hc_pen' in vars(args) and args.hc_pen:
-            self.ho_penetration = self.ho_pen_hc
-        else:
-            self.ho_penetration = self.ho_pen_oc
 
         self.table_height: float = 0.0
 
     def append_object(self, new_object_model):
         self.object_models.append(new_object_model)
 
-    def get_vertices(self, q=None):
-        vertices = self.hand_model.get_vertices(q)
+    def get_vertices(self):
+        vertices = self.hand_model.get_vertices()
         return vertices
 
-    def get_contacts(self, contact_idx, qs, q=None, downsample: bool = True, no_base: bool = False, with_objects: bool = False):
+    def get_contacts(self, contact_idx, qs, with_objects: bool = False):
         # vertices = self.hand_model.get_vertices(qs[:, -1])
         # self.hand_model.get_contact_points(contact_idx, contact_point_weight, qs[:, -1])
         # if handcodes is None:
@@ -93,13 +85,6 @@ class PhysicsGuide:
 
         return vertices, normals
 
-    def ho_pen_oc(self, obj: ODFieldModel, hand_verts=None):
-        # return obj.po_penetration(hand_verts).max(-1)[0]
-        return obj.po_penetration(hand_verts).sum(dim=-1)
-
-    def ho_pen_hc(self, obj: ODFieldModel, hand_verts=None):
-        return self.hand_model.penetration(obj.get_surface_points()).sum(dim=-1) * 1000
-
     def oo_penetration(self):
         """
         Calculate object-object penetration.
@@ -111,7 +96,7 @@ class PhysicsGuide:
         Returns:
             Sum of object-object penetration: `batch_size`
         """
-        batch_size = self.args.batch_size
+        batch_size = self.batch_size
         object_amount = len(self.object_models)
 
         penetration = torch.zeros(
@@ -187,11 +172,12 @@ class PhysicsGuide:
             force_closure.append(
                 self.fc_loss_model.fc_loss(cp, contact_normal))
 
-            penetration.append(self.ho_penetration(object_model, hand_verts))
+            penetration.append(
+                object_model.po_penetration(hand_verts).sum(dim=-1))
 
         penetration.append(self.hand_model.self_penetration())
 
-        if not self.args.levitate:
+        if not self.levitate:
             table_pntr = torch.relu(
                 self.table_height - hand_verts[:, :, 2]).sum(dim=-1)
             # table_pntr = torch.relu(self.table_height - hand_verts[:, :, 2]).max(dim=-1)[0]
@@ -208,15 +194,3 @@ class PhysicsGuide:
             return force_closure.sum(dim=1), distance.sum(-1).sum(-1), penetration.sum(dim=1), hand_prior, normal_alignment.sum(-1).sum(-1)
         else:
             return force_closure, distance, penetration, hand_prior, normal_alignment
-
-    # def get_stepsize(self, energy):
-    def get_stepsize(self, t: int) -> torch.Tensor:
-        # (t // stepsize_period)
-        return self.args.noise_size * self.args.temperature_decay ** torch.div(t, self.args.stepsize_period, rounding_mode='floor')
-        # return 0.02600707 + energy.unsqueeze(1) * 0.03950357 * 1e-3
-
-    # def get_temperature(self, energy):
-    def get_temperature(self, t: int) -> torch.Tensor:
-        # (t // annealing_period)
-        return self.args.starting_temperature * self.args.temperature_decay ** torch.div(t, self.args.annealing_period, rounding_mode='floor')
-        # return 0.02600707 + energy * 0.03950357

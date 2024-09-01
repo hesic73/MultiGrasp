@@ -26,6 +26,7 @@ from utils.ObjectModels import get_object_model
 from utils.PhysicsGuide import PhysicsGuide
 from utils.utils import *
 from utils.visualize_plotly import plot_mesh, plot_point_cloud, plot_rect
+from utils.EMA import EMA
 from tensorboardX import SummaryWriter
 
 from loguru import logger
@@ -33,7 +34,7 @@ from loguru import logger
 from torch.optim.adam import Adam
 
 
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import typer
 from argparse import Namespace
@@ -95,12 +96,14 @@ def sample_object_positions_and_rotations(physics_guide: PhysicsGuide, n_objects
     return object_ps, object_rs
 
 
-def synthesis(args, writer: SummaryWriter, export_dir: str):
+def synthesis(args, export_dir: str):
+    writer = SummaryWriter(logdir=export_dir)
+
     n_objects = len(args.object_models)
 
     transl_decay = 1.0
 
-    uuids = [str(uuid4()) for _ in range(args.batch_size)]
+    uuids: List[str] = [str(uuid4()) for _ in range(args.batch_size)]
 
     contact_group: List[List[int]] = contact_groups[args.contact_group]
     contact_pools: List[torch.Tensor] = [torch.tensor(get_contact_pool(
@@ -163,19 +166,24 @@ def synthesis(args, writer: SummaryWriter, export_dir: str):
 
     ones = torch.arange(0, args.batch_size, device=args.device).long()
 
+    grad_ema_q = EMA(0.98)
+
     # Steps with contact adjustment
     for step in tqdm(range(args.max_physics)):
-        step_size = physics_guide.get_stepsize(step)  # (,)
-        temperature = physics_guide.get_temperature(step)  # (,)
+        step_size = args.noise_size * args.temperature_decay ** torch.div(
+            step, args.stepsize_period, rounding_mode='floor')  # (,)
+        temperature = args.starting_temperature * \
+            args.temperature_decay ** torch.div(
+                step, args.annealing_period, rounding_mode='floor')  # (,)
         new_q = q.clone()
         new_cpi = cpi.clone()
 
-        q_grad_weight = max(args.max_physics * 0.8 - step,
-                            0) / args.max_physics * 75 + 25
+        q_grad_weight: float = max(args.max_physics * 0.8 - step,
+                                   0) / args.max_physics * 75 + 25
 
         # Updating handcode
         grad_q[:, 9:] = grad_q[:, 9:] / \
-            (physics_guide.grad_ema_q.average.unsqueeze(0) + 1e-12)
+            (grad_ema_q.average.unsqueeze(0) + 1e-12)
         noise = torch.normal(mean=0, std=args.noise_size, size=new_q.shape,
                              device='cuda', dtype=torch.float) * step_size  # * disabled_joint_mask
         new_q = new_q + (noise - 0.5 * grad_q * step_size *
@@ -214,14 +222,14 @@ def synthesis(args, writer: SummaryWriter, export_dir: str):
             grad_q[accept] = new_grad_q[accept]
             grad_w[accept] = new_grad_w[accept]
 
-            physics_guide.grad_ema_q.apply(grad_q[:, 9:] / q_grad_weight)
+            grad_ema_q.apply(grad_q[:, 9:] / q_grad_weight)
 
             if step % 100 == 99:
-                tqdm.write(f"Step { step }, Energy: { energy.mean().detach().cpu().numpy()} "
-                           + f"FC: { new_fc_error.mean().detach().cpu().numpy() } "
-                           + f"PN: { new_pntr.mean().detach().cpu().numpy() } "
-                           + f"SD: { (new_sf_dist / args.n_contact / n_objects).mean().detach().cpu().numpy() } "
-                           + f"HP: { new_hprior.mean().detach().cpu().numpy() }")
+                tqdm.write(f"Step {step:04d}, Energy: {energy.mean().detach().cpu().item():.4f} "
+                           + f"FC: {new_fc_error.mean().detach().cpu().item():.4f} "
+                           + f"PN: {new_pntr.mean().detach().cpu().item():.4f} "
+                           + f"SD: {(new_sf_dist / args.n_contact / n_objects).mean().detach().cpu().item():.4f} "
+                           + f"HP: {new_hprior.mean().detach().cpu().item():.4f}")
 
             if args.viz and step % 1000 == 0:
                 os.makedirs(os.path.join(export_dir, str(step)), exist_ok=True)
@@ -322,7 +330,18 @@ def synthesis(args, writer: SummaryWriter, export_dir: str):
          cpw, fc_error, sf_dist, pntr, hprior, norm_ali)
 
 
-def save(args, export_dir, uuids, physics_guide, q, cpi, cpw, fc_error, sf_dist, pntr, hprior, norm_ali, step=None):
+def save(args: Namespace, export_dir: str,
+         uuids: List[str],
+         physics_guide: PhysicsGuide,
+         q: torch.Tensor,
+         cpi: torch.Tensor,
+         cpw: torch.Tensor,
+         fc_error: torch.Tensor,
+         sf_dist: torch.Tensor,
+         pntr: torch.Tensor,
+         hprior: torch.Tensor,
+         norm_ali: torch.Tensor,
+         step: Optional[int] = None):
     with torch.no_grad():
         save_dict = {
             "args": args, "uuids": uuids,
@@ -367,7 +386,6 @@ def main(
     hprior_weight: float = 10.0,
     pen_weight: float = 10.0,
     sf_dist_weight: float = 10.0,
-    hc_pen: bool = False,
     viz: bool = False,
     log: bool = False,
     levitate: bool = False,
@@ -400,7 +418,6 @@ def main(
         hprior_weight=hprior_weight,
         pen_weight=pen_weight,
         sf_dist_weight=sf_dist_weight,
-        hc_pen=hc_pen,
         viz=viz,
         log=log,
         levitate=levitate,
@@ -424,12 +441,10 @@ def main(
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    writer = SummaryWriter(logdir=base_dir)
-
     json.dump(vars(args), open(os.path.join(
         base_dir, "args.json"), 'w'), default=lambda o: str(o))
 
-    synthesis(args, writer, base_dir)
+    synthesis(args, base_dir)
 
 
 if __name__ == '__main__':

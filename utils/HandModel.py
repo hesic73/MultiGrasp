@@ -159,7 +159,7 @@ class RoboticHand:
                     v2 = cp_basis[2, :3] - cp_basis[0, :3]
                     v1 = v1 / (torch.norm(v1) + 1e-12)
                     v2 = v2 / (torch.norm(v2) + 1e-12)
-                    normal = torch.cross(v1, v2).view([1, 3])
+                    normal = torch.linalg.cross(v1, v2).view([1, 3])
 
                     normals.append(normal)
                 if len(cpb) > 0:
@@ -256,7 +256,7 @@ class RoboticHand:
             v = v / torch.norm(v, dim=1).view(-1, 1)  # Normalize
             # Make sure that the z-component is positive
             v[:, -1] = torch.abs(v[:, -1]) + 0.5
-            axis = torch.cross(z, v)
+            axis = torch.linalg.cross(z, v)
             axis = axis / (torch.norm(axis, dim=1, keepdim=True) + 1e-12) * \
                 torch.acos(torch.clamp(
                     torch.sum(z * v, dim=1), -1, 1)).unsqueeze(-1)
@@ -363,7 +363,7 @@ class RoboticHand:
             _type_: contact point basic, contact point normal. Shape: (n_batch, n_contact, 3), (n_batch, n_contact, 3)
         """
         cpw = self.softmax(cpw)
-        B, *_ = cpi.shape
+
         cpb_trans, cpn_trans = [], []
         for link_name in self.contact_point_basis:
             trans_matrix = self.current_status[link_name].get_matrix().expand([
@@ -414,11 +414,8 @@ class RoboticHand:
             torch.relu(self.revolute_joints_q_lower - q[:, 9:])
         return range_energy.sum(-1)
 
-    def get_vertices(self, q=None):
-        if q is not None:
-            self.update_kinematics(q)
+    def get_vertices(self):
         surface_points = []
-
         for link_name in self.surface_points:
             trans_matrix = self.current_status[link_name].get_matrix().expand([
                 self.batch_size, 4, 4])

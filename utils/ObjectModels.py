@@ -49,7 +49,7 @@ class ODFieldModel():
         self.mesh = tm.load_mesh(meshpath, force='mesh')
 
         self.sdfield.load_state_dict(torch.load(os.path.join(
-            self.data_dir, f"{'sdfield' if signed else 'udfield'}.pt")))
+            self.data_dir, f"{'sdfield' if signed else 'udfield'}.pt"), weights_only=True))
         self.stable_rotations = torch.tensor(json.load(open(os.path.join(basedir, 'rotations_filtered.json'), 'r'))[
                                              object_model], dtype=torch.float32, device=self.device)
         self.load_mesh(self.mesh)
