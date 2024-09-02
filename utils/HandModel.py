@@ -19,7 +19,7 @@ from utils.utils_3d import compute_ortho6d_from_rotation_matrix, compute_rotatio
 from itertools import permutations
 
 
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 
 def get_mesh(geometry: xmlr.Object, mesh_path: str, hand_model: str):
@@ -41,6 +41,82 @@ def get_mesh(geometry: xmlr.Object, mesh_path: str, hand_model: str):
     else:
         raise NotImplementedError
     return mesh
+
+
+class RectContactAreas:
+    def __init__(self, basis: torch.Tensor, normals: torch.Tensor, batch_size: int, device):
+        """
+
+        Args:
+            basis (torch.Tensor): (n_areas, 4, 4)
+            normals (torch.Tensor): (n_areas, 3)
+        """
+        self.batch_size = batch_size
+        self.device = device
+        self.basis = basis  # (n_areas, 4, 4)
+        self.normals = normals  # (n_areas, 3)
+
+    def get_contact_points(self, trans_matrix: torch.Tensor, cpi: torch.Tensor, cpw: torch.Tensor, global_rotation: torch.Tensor, global_translation: torch.Tensor) -> torch.Tensor:
+        """
+
+        Args:
+            trans_matrix (torch.Tensor): (B, n_areas, 4, 4)
+            cpi (torch.Tensor): (B, n_contact)
+            cpw (torch.Tensor): (B, n_contact, 4)
+            global_rotation (torch.Tensor): (B, 3, 3)
+            global_translation (torch.Tensor): (B, 3)
+
+        Returns:
+            torch.Tensor: (B, n_contact, 3)
+        """
+        cpw = F.softmax(cpw, dim=-1)  # (B, n_contact, 4)
+        cpb_trans = self.basis.unsqueeze(0)  # (1, n_areas, 4, 4)
+        cpb_trans = torch.matmul(
+            trans_matrix, cpb_trans.transpose(-1, -2)).transpose(-1, -2)[..., :3]  # (B, n_areas, 4, 3)
+        cpb_trans = cpb_trans[torch.arange(0, self.batch_size, device=self.device).unsqueeze(
+            1).long(), cpi.long()]  # (B, n_contact, 4, 3)
+        cpb_trans = (cpb_trans * cpw.unsqueeze(-1)
+                     ).sum(dim=2)  # (B, n_contact, 3)
+        cpb_trans = torch.matmul(global_rotation, cpb_trans.transpose(
+            -1, -2)).transpose(-1, -2) + global_translation.unsqueeze(1)  # (B, n_contact, 3)
+
+        return cpb_trans
+
+    def get_contact_points_and_normal(self, trans_matrix: torch.Tensor, cpi: torch.Tensor, cpw: torch.Tensor, global_rotation: torch.Tensor, global_translation: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+
+        Args:
+            trans_matrix (torch.Tensor): (B, n_areas, 4, 4)
+            cpi (torch.Tensor): (B, n_contact)
+            cpw (torch.Tensor): (B, n_contact, 4)
+            global_rotation (torch.Tensor): (B, 3, 3)
+            global_translation (torch.Tensor): (B, 3)
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: (B, n_contact, 3), (B, n_contact, 3)
+        """
+
+        cpw = F.softmax(cpw, dim=-1)  # (B, n_contact, 4)
+        cpb_trans = self.basis.unsqueeze(0)  # (1, n_areas, 4, 4)
+        cpb_trans = torch.matmul(
+            trans_matrix, cpb_trans.transpose(-1, -2)).transpose(-1, -2)[..., :3]  # (B, n_areas, 4, 3)
+        cpb_trans = cpb_trans[torch.arange(0, self.batch_size, device=self.device).unsqueeze(
+            1).long(), cpi.long()]  # (B, n_contact, 4, 3)
+        cpb_trans = (cpb_trans * cpw.unsqueeze(-1)
+                     ).sum(dim=2)  # (B, n_contact, 3)
+        cpb_trans = torch.matmul(global_rotation, cpb_trans.transpose(
+            -1, -2)).transpose(-1, -2) + global_translation.unsqueeze(1)  # (B, n_contact, 3)
+
+        cpn_trans = self.normals.unsqueeze(0)  # (1, n_areas, 3)
+        cpn_trans = cpn_trans.expand(
+            self.batch_size, -1, -1)  # (B, n_areas, 3)
+        cpn_trans = torch.matmul(
+            trans_matrix[..., :3, :3], cpn_trans.unsqueeze(-1)).squeeze(-1)  # (B, n_areas, 3)
+        cpn_trans = cpn_trans[torch.arange(0, self.batch_size, device=self.device).unsqueeze(
+            1).long(), cpi.long()]  # (B, n_contact, 3)
+        cpn_trans = torch.matmul(
+            global_rotation, cpn_trans.transpose(-1, -2)).transpose(-1, -2)  # (B, n_contact, 3)
+        return cpb_trans, cpn_trans
 
 
 class RoboticHand:
@@ -67,8 +143,6 @@ class RoboticHand:
 
         self.contact_point_dict: Dict[str, List] = json.load(
             open(os.path.join("data/urdf/", 'contact_%s.json' % hand_model)))
-        self.contact_point_basis = {}
-        self.contact_normals = {}
         self.surface_points = {}
 
         self.penetration_keypoints_dict = json.load(
@@ -101,6 +175,11 @@ class RoboticHand:
         self.link_idx_to_pts_idx = {}
 
         self.n_pts = 0
+
+        contact_point_basis = {}
+        contact_normals = {}
+        self.link_rect_contact_area_cnt = {}
+        self.link_names = [link.name for link in visual.links]
 
         for i_link, link in enumerate(visual.links):
             link: Link
@@ -145,6 +224,7 @@ class RoboticHand:
             # Contact Points
             if link.name in self.contact_point_dict:
                 cpb = np.array(self.contact_point_dict[link.name])
+                self.link_rect_contact_area_cnt[link.name] = len(cpb)
 
                 basis, normals = [], []
 
@@ -165,11 +245,19 @@ class RoboticHand:
                     normals.append(normal)
                 if len(cpb) > 0:
                     # 1 x N_areas x 4 x 4
-                    self.contact_point_basis[link.name] = torch.stack(
+                    contact_point_basis[link.name] = torch.stack(
                         basis, dim=0).unsqueeze(0)
                     # 1 x N_areas x 3
-                    self.contact_normals[link.name] = torch.cat(
+                    contact_normals[link.name] = torch.cat(
                         normals, dim=0).unsqueeze(0)
+
+        basis = torch.cat([v for k, v in contact_point_basis.items()], dim=1).squeeze(
+            0)  # (n_areas, 4, 4)
+        normals = torch.cat(
+            [v for k, v in contact_normals.items()], dim=1).squeeze(0)  # (n_areas, 3)
+
+        self.rect_contact_areas = RectContactAreas(
+            basis, normals, batch_size, device)
 
         # new 2.1
         self.revolute_joints = []
@@ -284,6 +372,24 @@ class RoboticHand:
             q[:, 3:9])  # (batch_size, 3, 3)
         self.current_status = self.robot.forward_kinematics(q[:, 9:])
 
+    def _get_trans_matrix(self):
+        trans_matrix = []
+        for link_name in self.link_names:
+            if link_name in self.link_rect_contact_area_cnt:
+                _trans_matrix = self.current_status[link_name].get_matrix().expand(
+                    [self.batch_size,  4,
+                        4])  # (n_batch, 4, 4)
+                _trans_matrix = _trans_matrix.unsqueeze(
+                    1)  # (n_batch, 1, 4, 4)
+                cnt_area = self.link_rect_contact_area_cnt[link_name]
+                _trans_matrix = _trans_matrix.repeat(1, cnt_area, 1, 1)
+
+                trans_matrix.append(_trans_matrix)
+
+        trans_matrix = torch.cat(trans_matrix, dim=1).contiguous()
+
+        return trans_matrix  # (n_batch, n_areas, 4, 4)
+
     def get_contact_points(self, cpi: torch.Tensor, cpw: torch.Tensor):
         """_summary_
 
@@ -294,31 +400,11 @@ class RoboticHand:
         Returns:
             _type_: _description_
         """
-        cpw = self.softmax(cpw)
-        B = cpi.shape[0]
-        cpb_trans = []
-        for link_name in self.contact_point_basis:
-            trans_matrix = self.current_status[link_name].get_matrix().expand([
-                B, 4, 4])  # (B, 4, 4)
 
-            cp_basis = self.contact_point_basis[link_name]  # (1, N, 4, 4)
-            N = cp_basis.shape[1]
+        trans_matrix = self._get_trans_matrix()  # (n_batch, n_areas, 4, 4)
 
-            cp_basis = cp_basis.reshape([1, -1, 4])  # (1, 4*N, 4)
-
-            cp_basis = torch.matmul(
-                trans_matrix, cp_basis.transpose(-1, -2)).transpose(-1, -2).reshape([B, N, 4, 4])[..., :3]  # (B, N, 4, 3)
-
-            cpb_trans.append(cp_basis)
-
-        # (B, N, 4, 3) N denotes the number of contact areas
-        cpb_trans = torch.cat(cpb_trans, 1).contiguous()
-        cpb_trans = cpb_trans[torch.arange(
-            0, len(cpb_trans), device=self.device).unsqueeze(1).long(), cpi.long()]  # (B, n_contact, 4, 3)
-        cpb_trans = (cpb_trans * cpw.unsqueeze(-1)
-                     ).sum(dim=2)  # (B, n_contact, 3)
-        cpb_trans = torch.matmul(self.global_rotation, cpb_trans.transpose(
-            -1, -2)).transpose(-1, -2) + self.global_translation.unsqueeze(1)  # (B, n_contact, 3)
+        cpb_trans = self.rect_contact_areas.get_contact_points(
+            trans_matrix=trans_matrix, cpi=cpi, cpw=cpw, global_rotation=self.global_rotation, global_translation=self.global_translation)
 
         return cpb_trans * self.scale
 
@@ -363,41 +449,11 @@ class RoboticHand:
         Returns:
             _type_: contact point basic, contact point normal. Shape: (n_batch, n_contact, 3), (n_batch, n_contact, 3)
         """
-        cpw = self.softmax(cpw)
 
-        cpb_trans, cpn_trans = [], []
-        for link_name in self.contact_point_basis:
-            trans_matrix = self.current_status[link_name].get_matrix().expand([
-                self.batch_size, 4, 4])
-            cp_basis = self.contact_point_basis[link_name]
-            cp_normal = self.contact_normals[link_name]
-            N = cp_basis.shape[1]
+        trans_matrix = self._get_trans_matrix()  # (n_batch, n_areas, 4, 4)
 
-            cp_basis = cp_basis.expand([self.batch_size, cp_basis.shape[1], 4, 4]).reshape(
-                [self.batch_size, -1, 4])
-            cp_normal = cp_normal.expand(
-                [self.batch_size, cp_normal.shape[1], 3])
-
-            cp_basis = torch.matmul(trans_matrix, cp_basis.transpose(-1, -2)
-                                    ).transpose(-1, -2).reshape([self.batch_size, N, 4, 4])[..., :3]
-            cp_normal = torch.matmul(trans_matrix[..., :3, :3], cp_normal.transpose(
-                -1, -2)).transpose(-1, -2).reshape([self.batch_size, N, 3])
-
-            cpb_trans.append(cp_basis)
-            cpn_trans.append(cp_normal)
-
-        cpb_trans = torch.cat(cpb_trans, 1).contiguous()
-        cpb_trans = cpb_trans[torch.arange(
-            0, len(cpb_trans), device=self.device).unsqueeze(1).long(), cpi.long()]
-        cpb_trans = (cpb_trans * cpw.unsqueeze(-1)).sum(2)
-        cpb_trans = torch.matmul(self.global_rotation, cpb_trans.transpose(
-            -1, -2)).transpose(-1, -2) + self.global_translation.unsqueeze(1)
-
-        cpn_trans = torch.cat(cpn_trans, 1).contiguous()
-        cpn_trans = cpn_trans[torch.arange(
-            0, len(cpn_trans), device=self.device).unsqueeze(1).long(), cpi.long()]
-        cpn_trans = torch.matmul(self.global_rotation,
-                                 cpn_trans.transpose(1, 2)).transpose(1, 2)
+        cpb_trans, cpn_trans = self.rect_contact_areas.get_contact_points_and_normal(
+            trans_matrix=trans_matrix, cpi=cpi, cpw=cpw, global_rotation=self.global_rotation, global_translation=self.global_translation)
 
         # (n_batch, n_contact, 3), (n_batch, n_contact, 3)
         return cpb_trans * self.scale, cpn_trans
