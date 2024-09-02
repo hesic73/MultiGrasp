@@ -9,6 +9,7 @@ import transforms3d
 import trimesh as tm
 import pytorch_kinematics.urdf_parser_py.urdf as URDF_PARSER
 from pytorch_kinematics.urdf_parser_py.urdf import Robot, Link
+from pytorch_kinematics.urdf_parser_py.urdf import xmlr
 from pytorch3d import transforms
 from pytorch_kinematics.urdf_parser_py.urdf import (URDF, Box, Cylinder, Mesh,
                                                     Sphere)
@@ -21,10 +22,30 @@ from itertools import permutations
 from typing import Dict, List
 
 
+def get_mesh(geometry: xmlr.Object, mesh_path: str, hand_model: str):
+    if isinstance(geometry, Mesh):
+        if hand_model == 'shadowhand' or hand_model == 'allegro' or hand_model == 'barrett' or hand_model == 'tonghand' or hand_model == 'tonghand_viz':
+            filename = geometry.filename.split('/')[-1]
+        else:
+            filename = geometry.filename
+        mesh = tm.load(os.path.join(mesh_path, filename),
+                       force='mesh', process=False)
+    elif isinstance(geometry, Cylinder):
+        mesh = tm.primitives.Cylinder(
+            radius=geometry.radius, height=geometry.length)
+    elif isinstance(geometry, Box):
+        mesh = tm.primitives.Box(extents=geometry.size)
+    elif isinstance(geometry, Sphere):
+        mesh = tm.primitives.Sphere(
+            radius=geometry.radius)
+    else:
+        raise NotImplementedError
+    return mesh
+
+
 class RoboticHand:
-    def __init__(self, hand_model: str, urdf_filename: str, mesh_path: str, specs_path=None,
+    def __init__(self, hand_model: str, urdf_filename: str, mesh_path: str,
                  batch_size: int = 1, hand_scale: float = 1., pts_density: float = 25000,
-                 stl_mesh=False,
                  device=torch.device(
                      'cuda' if torch.cuda.is_available() else 'cpu'),
                  **kwargs
@@ -77,11 +98,6 @@ class RoboticHand:
         self.contact_permutations = [list(p)
                                      for p in permutations(np.arange(3))]
 
-        self.canon_verts = []
-        self.canon_faces = []
-        self.idx_vert_faces = []
-        self.face_normals = []
-
         self.link_idx_to_pts_idx = {}
 
         self.n_pts = 0
@@ -91,49 +107,34 @@ class RoboticHand:
             if len(link.visuals) == 0:
                 continue
 
-            if type(link.visuals[0].geometry) == Mesh:
-                if hand_model == 'shadowhand' or hand_model == 'allegro' or hand_model == 'barrett' or hand_model == 'tonghand' or hand_model == 'tonghand_viz':
-                    filename = link.visuals[0].geometry.filename.split('/')[-1]
-                else:
-                    filename = link.visuals[0].geometry.filename
+            mesh = get_mesh(link.visuals[0].geometry, mesh_path, hand_model)
 
-                mesh = tm.load(os.path.join(mesh_path, filename),
-                               force='mesh', process=False)
-            elif type(link.visuals[0].geometry) == Cylinder:
-                mesh = tm.primitives.Cylinder(
-                    radius=link.visuals[0].geometry.radius, height=link.visuals[0].geometry.length)
-            elif type(link.visuals[0].geometry) == Box:
-                mesh = tm.primitives.Box(extents=link.visuals[0].geometry.size)
-            elif type(link.visuals[0].geometry) == Sphere:
-                mesh = tm.primitives.Sphere(
-                    radius=link.visuals[0].geometry.radius)
+            scale = link.visuals[0].geometry.scale
+            if scale is None:
+                scale = np.array([[1, 1, 1]])
             else:
-                raise NotImplementedError
-            try:
                 scale = np.array(
                     link.visuals[0].geometry.scale).reshape([1, 3])
-            except:
-                scale = np.array([[1, 1, 1]])
 
-            try:
-                rotation = transforms3d.euler.euler2mat(
-                    *link.visuals[0].origin.rpy)
-                translation = np.reshape(link.visuals[0].origin.xyz, [1, 3])
-            except AttributeError:
+            origin = link.visuals[0].origin
+            if origin is None:
                 rotation = transforms3d.euler.euler2mat(0, 0, 0)
                 translation = np.array([[0, 0, 0]])
+            else:
+                rotation = transforms3d.euler.euler2mat(*origin.rpy)
+                translation = np.reshape(origin.xyz, [1, 3])
 
             num_part_pts = int(mesh.area * pts_density)
             self.link_idx_to_pts_idx[link.name] = torch.tensor(
                 np.arange(num_part_pts) + self.n_pts).to(self.device)
-            pts = mesh.sample(num_part_pts) * scale
+            pts = mesh.sample(num_part_pts) * scale  # (n_pts, 3
             self.n_pts += num_part_pts
 
             # Surface Points
             pts = np.matmul(rotation, pts.T).T + translation
             pts = np.concatenate([pts, np.ones([len(pts), 1])], axis=-1)
             self.surface_points[link.name] = torch.from_numpy(
-                pts).to(device).float().unsqueeze(0)
+                pts).to(device).float().unsqueeze(0)  # (1, n_pts, 4)
 
             # Visualization Mesh
             self.mesh_verts[link.name] = np.array(mesh.vertices) * scale
@@ -163,17 +164,12 @@ class RoboticHand:
 
                     normals.append(normal)
                 if len(cpb) > 0:
-                    # N_areas x 4 x 3
+                    # 1 x N_areas x 4 x 4
                     self.contact_point_basis[link.name] = torch.stack(
                         basis, dim=0).unsqueeze(0)
-                    # N_areas x 3
+                    # 1 x N_areas x 3
                     self.contact_normals[link.name] = torch.cat(
                         normals, dim=0).unsqueeze(0)
-
-            # self.canon_verts.append(torch.tensor(self.mesh_verts[link.name]).to(device).float().unsqueeze(0) * hand_scale)
-            # self.canon_faces.append(torch.tensor(mesh.faces).long().to(self.device))
-            # self.idx_vert_faces.append(index_vertices_by_faces(self.canon_verts[-1], self.canon_faces[-1]))
-            # self.face_normals.append(face_normals(self.idx_vert_faces[-1], unit=True))
 
         # new 2.1
         self.revolute_joints = []
@@ -204,7 +200,7 @@ class RoboticHand:
         self.revolute_joints_q_upper = torch.Tensor(
             self.revolute_joints_q_upper).to(device)
 
-        self.current_status: Dict[str, Link] = None
+        self.current_status: Dict[str, pk.Transform3d] = None
 
         self.canon_pose = torch.tensor(
             [0, 0, 0, 1, 0, 0, 0, 1, 0] + [0] * (self.q_len - 9), device=device, dtype=torch.float32)
@@ -222,7 +218,7 @@ class RoboticHand:
         # print(f"[{hand_model}] {self.num_contacts} contact points, {self.n_pts} surface points")
 
     def random_handcode(self, batch_size: int, table_top: bool = True) -> torch.Tensor:
-        """_summary_
+        """Generate random handcode
 
         Args:
             batch_size (int): _description_
@@ -277,47 +273,52 @@ class RoboticHand:
         return q
 
     def update_kinematics(self, q: torch.Tensor):
+        """Update kinematics
+
+        Args:
+            q (torch.Tensor): (batch_size, q_len)
+        """
         self.batch_size = q.shape[0]
         self.global_translation = q[:, :3] / self.scale  # (batch_size, 3)
         self.global_rotation = compute_rotation_matrix_from_ortho6d(
             q[:, 3:9])  # (batch_size, 3, 3)
         self.current_status = self.robot.forward_kinematics(q[:, 9:])
 
-    def get_contact_points(self, cpi: torch.Tensor, cpw: torch.Tensor, q=None):
+    def get_contact_points(self, cpi: torch.Tensor, cpw: torch.Tensor):
         """_summary_
 
         Args:
             cpi (torch.Tensor): contact point index. Shape: (n_batch, n_contact)
             cpw (torch.Tensor): contact point weight. Shape: (n_batch, n_contact, 4)
-            q (_type_, optional): _description_. Defaults to None.
 
         Returns:
             _type_: _description_
         """
         cpw = self.softmax(cpw)
         B = cpi.shape[0]
-        if q is not None:
-            self.update_kinematics(q)
         cpb_trans = []
         for link_name in self.contact_point_basis:
             trans_matrix = self.current_status[link_name].get_matrix().expand([
-                B, 4, 4])
-            cp_basis = self.contact_point_basis[link_name].expand(
-                [B, self.contact_point_basis[link_name].shape[1], 4, 4])
+                B, 4, 4])  # (B, 4, 4)
+
+            cp_basis = self.contact_point_basis[link_name]  # (1, N, 4, 4)
             N = cp_basis.shape[1]
 
-            cp_basis = cp_basis.reshape([B, -1, 4])
+            cp_basis = cp_basis.reshape([1, -1, 4])  # (1, 4*N, 4)
+
             cp_basis = torch.matmul(
-                trans_matrix, cp_basis.transpose(-1, -2)).transpose(-1, -2).reshape([B, N, 4, 4])[..., :3]
+                trans_matrix, cp_basis.transpose(-1, -2)).transpose(-1, -2).reshape([B, N, 4, 4])[..., :3]  # (B, N, 4, 3)
 
             cpb_trans.append(cp_basis)
 
+        # (B, N, 4, 3) N denotes the number of contact areas
         cpb_trans = torch.cat(cpb_trans, 1).contiguous()
         cpb_trans = cpb_trans[torch.arange(
-            0, len(cpb_trans), device=self.device).unsqueeze(1).long(), cpi.long()]
-        cpb_trans = (cpb_trans * cpw.unsqueeze(-1)).sum(2)
+            0, len(cpb_trans), device=self.device).unsqueeze(1).long(), cpi.long()]  # (B, n_contact, 4, 3)
+        cpb_trans = (cpb_trans * cpw.unsqueeze(-1)
+                     ).sum(dim=2)  # (B, n_contact, 3)
         cpb_trans = torch.matmul(self.global_rotation, cpb_trans.transpose(
-            -1, -2)).transpose(-1, -2) + self.global_translation.unsqueeze(1)
+            -1, -2)).transpose(-1, -2) + self.global_translation.unsqueeze(1)  # (B, n_contact, 3)
 
         return cpb_trans * self.scale
 
