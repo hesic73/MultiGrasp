@@ -21,7 +21,7 @@ from plotly import graph_objects as go
 from tqdm import tqdm, trange
 from hand_consts_allegro import get_contact_pool, contact_groups
 
-from utils.HandModel import get_hand_model
+from utils.HandModel import get_hand_model, RoboticHand
 from utils.ObjectModels import get_object_model
 from utils.PhysicsGuide import PhysicsGuide
 from utils.utils import *
@@ -94,6 +94,32 @@ def sample_object_positions_and_rotations(physics_guide: PhysicsGuide, n_objects
     object_rs = torch.cat(object_rs, dim=0).contiguous()
 
     return object_ps, object_rs
+
+
+@torch.no_grad()
+def visualize(physics_guide: PhysicsGuide, hand_model: RoboticHand, n_contact: int, n_objects: int, q: torch.Tensor, cpi: torch.Tensor, cpw: torch.Tensor, export_dir: str, step: int):
+    os.makedirs(os.path.join(export_dir, str(step)), exist_ok=True)
+    hand_model.update_kinematics(q)
+    contacts = [hand_model.get_contact_areas(
+        cpi[:, j]).detach().cpu().numpy() for j in range(n_objects)]
+    contact_pts = [hand_model.get_contact_points(
+        cpi[:, j], cpw[:, j]).detach().cpu().numpy() for j in range(n_objects)]
+    pntr_kpts = hand_model.get_penetration_keypoints().cpu().numpy()
+    for i in range(8):
+        go.Figure([plot_mesh(o.get_obj_mesh(i), name=f"object-{j}") for j, o in enumerate(physics_guide.object_models)]
+                  + [plot_rect(contacts[j][i, k], name=f"contact-{j}_{k}", color='red') for j in range(
+                      n_objects) for k in range(n_contact)]
+                  + [plot_mesh(tm.load("data/table.stl"), color='green'), plot_mesh(
+                      hand_model.get_meshes_from_q(None, i, True), 'lightpink', opacity=1.0)]
+                  ).write_html(os.path.join(export_dir, str(step), f"{i}.html"))
+
+
+def print_metrics(step: int, energy: torch.Tensor, new_fc_error: torch.Tensor, new_sf_dist: torch.Tensor, new_pntr: torch.Tensor, new_hprior: torch.Tensor, n_contact: int, n_objects: int):
+    tqdm.write(f"Step {step:04d}, Energy: {energy.mean().detach().cpu().item():.4f} "
+               + f"FC: {new_fc_error.mean().detach().cpu().item():.4f} "
+               + f"PN: {new_pntr.mean().detach().cpu().item():.4f} "
+               + f"SD: {(new_sf_dist / n_contact / n_objects).mean().detach().cpu().item():.4f} "
+               + f"HP: {new_hprior.mean().detach().cpu().item():.4f}")
 
 
 def synthesis(args, export_dir: str):
@@ -225,27 +251,12 @@ def synthesis(args, export_dir: str):
             grad_ema_q.apply(grad_q[:, 9:] / q_grad_weight)
 
             if step % 100 == 99:
-                tqdm.write(f"Step {step:04d}, Energy: {energy.mean().detach().cpu().item():.4f} "
-                           + f"FC: {new_fc_error.mean().detach().cpu().item():.4f} "
-                           + f"PN: {new_pntr.mean().detach().cpu().item():.4f} "
-                           + f"SD: {(new_sf_dist / args.n_contact / n_objects).mean().detach().cpu().item():.4f} "
-                           + f"HP: {new_hprior.mean().detach().cpu().item():.4f}")
+                print_metrics(step, energy, new_fc_error,
+                              new_sf_dist, new_pntr, new_hprior, args.n_contact, n_objects)
 
             if args.viz and step % 1000 == 0:
-                os.makedirs(os.path.join(export_dir, str(step)), exist_ok=True)
-                hand_model.update_kinematics(q)
-                contacts = [hand_model.get_contact_areas(
-                    cpi[:, j]).cpu().numpy() for j in range(n_objects)]
-                contact_pts = [hand_model.get_contact_points(
-                    cpi[:, j], cpw[:, j]).cpu().numpy() for j in range(n_objects)]
-                pntr_kpts = hand_model.get_penetration_keypoints().cpu().numpy()
-                for i in range(8):
-                    go.Figure([plot_mesh(o.get_obj_mesh(i), name=f"object-{j}") for j, o in enumerate(physics_guide.object_models)]
-                              + [plot_rect(contacts[j][i, k], name=f"contact-{j}_{k}", color='red') for j in range(
-                                  n_objects) for k in range(args.n_contact)]
-                              + [plot_mesh(tm.load("data/table.stl"), color='green'), plot_mesh(
-                                  hand_model.get_meshes_from_q(None, i, True), 'lightpink', opacity=1.0)]
-                              ).write_html(os.path.join(export_dir, str(step), f"{i}.html"))
+                visualize(physics_guide, hand_model, args.n_contact,
+                          n_objects, q, cpi, cpw, export_dir, step)
 
             if args.log and step % 10 == 9:
                 writer.add_scalar("MALA/stepsize", step_size, step)
@@ -285,11 +296,8 @@ def synthesis(args, export_dir: str):
         optimizer.step()
 
         if step % 100 == 99:
-            tqdm.write(f"Step { step }, Energy: { energy.mean().detach().cpu().numpy()} "
-                       + f"FC: { fc_error.mean().detach().cpu().numpy() } "
-                       + f"PN: { pntr.mean().detach().cpu().numpy() } "
-                       + f"SD: { (sf_dist / args.n_contact / n_objects).mean().detach().cpu().numpy() } "
-                       + f"HP: { hprior.mean().detach().cpu().numpy() }")
+            print_metrics(step, energy, new_fc_error,
+                          new_sf_dist, new_pntr, new_hprior, args.n_contact, n_objects)
 
         if args.log and step % 10 == 9:
             writer.add_scalar(
@@ -304,23 +312,8 @@ def synthesis(args, export_dir: str):
                 "Grasp/hand_prior", hprior.mean().detach().cpu().numpy(), step + args.max_physics)
 
         if args.viz and step % 1000 == 0:
-            os.makedirs(os.path.join(export_dir, str(step)), exist_ok=True)
-            hand_model.update_kinematics(q)
-            contacts = [hand_model.get_contact_areas(
-                cpi[:, j]).detach().cpu().numpy() for j in range(n_objects)]
-            contact_pts = [hand_model.get_contact_points(
-                cpi[:, j], cpw[:, j]).detach().cpu().numpy() for j in range(n_objects)]
-            pntr_kpts = hand_model.get_penetration_keypoints().detach().cpu().numpy()
-            for i in range(8):
-                go.Figure([plot_mesh(o.get_obj_mesh(i), name=f"object-{j}") for j, o in enumerate(physics_guide.object_models)]
-                          + [plot_point_cloud(pntr_kpts[i],
-                                              name=f"pntr-kpts", surfacecolor='blue')]
-                          + [plot_point_cloud(contact_pts[j][i], name=f"contact-{j}") for j in range(n_objects)]
-                          + [plot_rect(contacts[j][i, k], name=f"contact-{j}_{k}", color='red') for j in range(
-                              n_objects) for k in range(args.n_contact)]
-                          + [plot_mesh(tm.load("data/table.stl"), color='green'), plot_mesh(
-                              hand_model.get_meshes_from_q(None, i, True), 'lightpink', opacity=1.0)]
-                          ).write_html(os.path.join(export_dir, str(step), f"{i}.html"))
+            visualize(physics_guide, hand_model, args.n_contact,
+                      n_objects, q, cpi, cpw, export_dir, step + args.max_physics)
 
     logger.info("> Saving checkpoint...")
 

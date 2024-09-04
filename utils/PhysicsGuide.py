@@ -136,7 +136,6 @@ class PhysicsGuide:
         Returns:
             _type_: _description_
         """
-        B, N_o, N_c = cpi.shape
 
         # Compute hand
         self.hand_model.update_kinematics(q)
